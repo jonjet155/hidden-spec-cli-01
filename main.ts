@@ -190,6 +190,11 @@ function fileText(v: FileView): string {
 
 const trimEndWs = (s: string): string => s.replace(/[ \t]+$/, '');
 const trimWs = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+// [r18319 / AMB 29] SPEC uses "spaces" (0x20 only) for paths and anchors, and
+// "whitespace" where any whitespace is meant (§8 path/anchor vs Begin/End;
+// §5 "spaces and tabs" proves spaces != tabs). So these trims remove only
+// 0x20, NOT tabs — a trailing tab stays part of the path/anchor.
+const trimSpaces = (s: string): string => s.replace(/^ +| +$/g, '');
 const leadWs = (s: string): string => {
   const m = /^[ \t]*/.exec(s);
   return m ? m[0] : '';
@@ -293,7 +298,7 @@ interface USection {
 /** The path after `--- ` / `+++ `: up to the first tab, surrounding spaces removed,
  *  `/dev/null` meaning no file, a leading `a/` or `b/` removed. */
 function diffPath(raw: string): string | null {
-  let s = raw.split('\t')[0]!.trim();
+  let s = trimSpaces(raw.split('\t')[0]!);
   if (s === '/dev/null') return null;
   if (s.startsWith('a/') || s.startsWith('b/')) s = s.slice(2);
   return s;
@@ -341,7 +346,12 @@ function parseUnified(lines: string[]): USection[] {
           i++;
         } else break;
       }
-      while (items.length > 0 && items[items.length - 1]!.kind === 'ctx' && items[items.length - 1]!.text === '') items.pop();
+      // [D2] "empty lines at the end of a body are not part of it" (§6): a ctx
+      // line with empty text is trimmed only when it is truly last. An item
+      // carrying mark=true is followed by a `\` line, so it is NOT at the end
+      // of the body and must stay (else O loses the empty line and the `\`
+      // no longer follows the hunk's last context line).
+      while (items.length > 0 && items[items.length - 1]!.kind === 'ctx' && items[items.length - 1]!.text === '' && !items[items.length - 1]!.mark) items.pop();
       cur.hunks.push({ a: Number(m[1]), items });
       continue;
     }
@@ -435,6 +445,9 @@ function unifiedEdits(sections: USection[], strict: boolean): Edit[] {
       const src = oldP!;
       const before = tree.get(src);
       if (before === null) throw new Fail('missing', src);
+      // [r1067] §6, a move: "the old path exists (else missing), the new path
+      // does not (else exists)". Checked before the hunks, after missing.
+      if (isMove && tree.get(newP!) !== null) throw new Fail('exists', newP!);
       const view = fileView(before);
       let d = 0;
       for (const h of s.hunks) {
@@ -609,13 +622,13 @@ function parseV4A(lines: string[]): VSection[] {
     let path = '';
     if (line.startsWith(ADD_PREFIX)) {
       kind = 'add';
-      path = line.slice(ADD_PREFIX.length).trim();
+      path = trimSpaces(line.slice(ADD_PREFIX.length));
     } else if (line.startsWith(DEL_PREFIX)) {
       kind = 'delete';
-      path = line.slice(DEL_PREFIX.length).trim();
+      path = trimSpaces(line.slice(DEL_PREFIX.length));
     } else if (line.startsWith(UPD_PREFIX)) {
       kind = 'update';
-      path = line.slice(UPD_PREFIX.length).trim();
+      path = trimSpaces(line.slice(UPD_PREFIX.length));
     } else {
       throw new Exit2(`error: parse ${i + 1}`);
     }
@@ -638,15 +651,17 @@ function parseV4A(lines: string[]): VSection[] {
       }
       sections.push({ kind, path, moveTo: null, lines: flines, chunks: [], lineNo: secLine });
     } else if (kind === 'delete') {
-      for (const r of raw) {
-        if (!blank(r.text)) throw new Exit2(`error: parse ${r.idx + 1}`);
-      }
+      // [r3345] §8: "a Delete File section has no lines" + "Any other line is
+      // error: parse". Blank lines are excused only at the end of a section
+      // (already popped from raw) and between sections (never in raw), so any
+      // line left in raw — blank or not — is a parse error at that line.
+      if (raw.length > 0) throw new Exit2(`error: parse ${raw[0]!.idx + 1}`);
       sections.push({ kind, path, moveTo: null, lines: [], chunks: [], lineNo: secLine });
     } else {
       let moveTo: string | null = null;
       let j = 0;
       if (raw.length > 0 && raw[0]!.text.startsWith(MOVE_PREFIX)) {
-        moveTo = raw[0]!.text.slice(MOVE_PREFIX.length).trim();
+        moveTo = trimSpaces(raw[0]!.text.slice(MOVE_PREFIX.length));
         j = 1;
       }
       const chunks: VChunk[] = [];
@@ -655,7 +670,7 @@ function parseV4A(lines: string[]): VSection[] {
         const r = raw[j]!;
         const l = r.text;
         if (l.startsWith('@@')) {
-          const anchor = l.slice(2).trim();
+          const anchor = trimSpaces(l.slice(2));
           cur = { anchor: anchor === '' ? null : anchor, items: [], eof: false };
           chunks.push(cur);
           continue;
@@ -672,7 +687,12 @@ function parseV4A(lines: string[]): VSection[] {
               cur = { anchor: null, items: [], eof: false };
               chunks.push(cur);
             } else if (l === '') {
-              continue;
+              // [D4] A blank line after `*** End of File` (before the next `@@`)
+              // is neither "between sections" nor "at the end of a section", so
+              // it is "any other line" -> error: parse (§8). (Blank lines at the
+              // end of a section are already dropped by the trailing-blank pop
+              // on raw, so they never reach this branch.)
+              throw new Exit2(`error: parse ${r.idx + 1}`);
             } else {
               throw new Exit2(`error: parse ${r.idx + 1}`);
             }
@@ -839,15 +859,22 @@ function run(args: string[]): { code: number; out: string[] } {
   rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)) || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0));
   const out = [...rows.map((r) => r.text), `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`];
   if (!check) {
+    // [r513] Delete first, then write. A single pass in now-insertion order can
+    // crash when a move's new path sits inside its old path (e.g. lib -> lib/a:
+    // now lists lib/a before lib, so mkdir 'lib' hits the still-present file).
+    // Deleting every removed file first makes the after-tree always reachable.
     for (const p of [...tree.now.keys()]) {
       const was = tree.original(p);
       const now = tree.now.get(p)!;
-      if (was === now) continue;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
-      }
+      if (was === now || now !== null) continue;
+      rmSync(p, { force: true });
+    }
+    for (const p of [...tree.now.keys()]) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now || now === null) continue;
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, now);
     }
   }
   return { code: 0, out };
